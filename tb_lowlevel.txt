@@ -1,0 +1,212 @@
+/******************************************************************************
+
+This is a draft of the low-level pseudocode for the testbench for our 
+parameterized, sychronous FIFO system.
+
+@author:  Allen Paul
+@date:    11/19/2026
+@version: 1.0.1
+
+*******************************************************************************/
+
+
+
+
+// ============================================================================
+// PARAMETERS & INTERFACE DEFINITIONS
+// ============================================================================
+PARAMETER DATA_WIDTH = 8          // Configurable data width
+PARAMETER DEPTH      = 16         // Configurable storage depth
+PARAMETER CLK_PERIOD = 10ns
+
+// Testbench Signals matching DUT port list
+LOGIC clk
+LOGIC rst
+LOGIC wr_en
+LOGIC rd_en
+LOGIC [DATA_WIDTH-1:0] wr_data
+LOGIC [DATA_WIDTH-1:0] rd_data
+LOGIC full
+LOGIC empty
+
+// Reference Model / Scoreboard Structure
+QUEUE [DATA_WIDTH-1:0] expected_queue
+INTEGER error_count = 0
+INTEGER transaction_count = 0
+
+// ============================================================================
+// CLOCK & RESET GENERATION
+// ============================================================================
+PROCESS clock_generator:
+    clk = 0
+    FOREVER:
+        WAIT (CLK_PERIOD / 2)
+        clk = ~clk
+
+TASK apply_reset():
+    rst     = 1
+    wr_en   = 0
+    rd_en   = 0
+    wr_data = 0
+    CLEAR(expected_queue)
+    REPEAT (3) @(posedge clk)
+    rst = 0
+    @(posedge clk)
+    // Verify post-reset state
+    ASSERT (empty == 1 AND full == 0) ELSE INCREMENT(error_count)
+
+// ============================================================================
+// DRIVER TASKS (LOW-LEVEL PIN WIGGLING)
+// ============================================================================
+TASK drive_write(input [DATA_WIDTH-1:0] data):
+    @(negedge clk)
+    wr_en   = 1
+    rd_en   = 0
+    wr_data = data
+    @(posedge clk)
+    #1step // Allow signals to settle before deasserting
+    wr_en   = 0
+
+TASK drive_read():
+    @(negedge clk)
+    wr_en = 0
+    rd_en = 1
+    @(posedge clk)
+    #1step
+    rd_en = 0
+
+TASK drive_simultaneous_rw(input [DATA_WIDTH-1:0] data):
+    @(negedge clk)
+    wr_en   = 1
+    rd_en   = 1
+    wr_data = data
+    @(posedge clk)
+    #1step
+    wr_en   = 0
+    rd_en   = 0
+
+TASK drive_idle():
+    @(negedge clk)
+    wr_en = 0
+    rd_en = 0
+    @(posedge clk)
+
+// ============================================================================
+// MONITOR & SELF-CHECKING SCOREBOARD
+// ============================================================================
+PROCESS monitor_and_scoreboard:
+    FOREVER @(posedge clk):
+        IF (rst == 1):
+            CLEAR(expected_queue)
+            CONTINUE
+
+        // Sample pre-edge flag states to determine if operations are accepted
+        BOOL write_accepted = (wr_en == 1) AND (full == 0)
+        BOOL read_accepted  = (rd_en == 1) AND (empty == 0)
+
+        // Note: If read latency is 1 cycle (registered output), wait 1 delta/cycle
+        // before sampling rd_data. Assuming standard 1-cycle registered read:
+        IF (read_accepted):
+            LOGIC [DATA_WIDTH-1:0] expected_val = POP_FRONT(expected_queue)
+            WAIT_FOR_OUTPUT_SETTLE() // e.g., @(negedge clk) or #1step after posedge
+            IF (rd_data !== expected_val):
+                LOG_ERROR("Data mismatch! Expected: %h, Got: %h", expected_val, rd_data)
+                INCREMENT(error_count)
+            INCREMENT(transaction_count)
+
+        IF (write_accepted):
+            PUSH_BACK(expected_queue, wr_data)
+
+        // Check flag consistency against reference queue size
+        WAIT_FOR_OUTPUT_SETTLE()
+        IF (SIZE(expected_queue) == 0 AND empty !== 1):
+            LOG_ERROR("Flag error: Queue empty, but empty flag is 0")
+            INCREMENT(error_count)
+        IF (SIZE(expected_queue) == DEPTH AND full !== 1):
+            LOG_ERROR("Flag error: Queue full, but full flag is 0")
+            INCREMENT(error_count)
+
+// ============================================================================
+// CONCURRENT ASSERTIONS (SVA EQUIVALENT)
+// ============================================================================
+ASSERTION no_full_and_empty_simultaneously:
+    AT EVERY (posedge clk) DISABLE IF (rst):
+        NOT (full == 1 AND empty == 1)
+
+ASSERTION pointer_stability_on_overflow:
+    AT EVERY (posedge clk) DISABLE IF (rst):
+        IF (full == 1 AND wr_en == 1 AND rd_en == 0):
+            NEXT_CYCLE(full == 1)
+
+ASSERTION pointer_stability_on_underflow:
+    AT EVERY (posedge clk) DISABLE IF (rst):
+        IF (empty == 1 AND rd_en == 1 AND wr_en == 0):
+            NEXT_CYCLE(empty == 1)
+
+// ============================================================================
+// FUNCTIONAL COVERAGE MODEL
+// ============================================================================
+COVERGROUP fifo_cg @(posedge clk):
+    CP_WR_EN:  COVERPOINT wr_en
+    CP_RD_EN:  COVERPOINT rd_en
+    CP_FULL:   COVERPOINT full
+    CP_EMPTY:  COVERPOINT empty
+    
+    // Cross coverage for corner cases
+    CROSS_OPS:   CROSS CP_WR_EN, CP_RD_EN               // Simultaneous R/W
+    CROSS_FULL:  CROSS CP_WR_EN, CP_FULL                // Write when full
+    CROSS_EMPTY: CROSS CP_RD_EN, CP_EMPTY               // Read when empty
+
+// ============================================================================
+// MAIN TEST SEQUENCER (DIRECTED & CONSTRAINED-RANDOM)
+// ============================================================================
+INITIAL_BLOCK main_test:
+    INSTANTIATE_DUT(DATA_WIDTH, DEPTH)
+    FORK
+        clock_generator()
+        monitor_and_scoreboard()
+    JOIN_NONE
+
+    // 1. Initial Reset Test
+    apply_reset()
+
+    // 2. Directed Test: Fill to Capacity & Test Overflow
+    FOR i = 0 TO (DEPTH - 1):
+        drive_write(RANDOM_DATA())
+    ASSERT (full == 1)
+    drive_write(RANDOM_DATA()) // Attempt write while full (should be ignored)
+
+    // 3. Directed Test: Drain to Empty & Test Underflow
+    FOR i = 0 TO (DEPTH - 1):
+        drive_read()
+    ASSERT (empty == 1)
+    drive_read() // Attempt read while empty (should be ignored)
+
+    // 4. Directed Test: Pointer Wrap-Around & Simultaneous Read/Write
+    FOR i = 0 TO (DEPTH / 2):
+        drive_write(RANDOM_DATA())
+    REPEAT (DEPTH * 2):
+        drive_simultaneous_rw(RANDOM_DATA()) // Forces pointers past DEPTH boundary
+
+    // 5. Mid-Operation Reset Test
+    apply_reset()
+
+    // 6. Constrained-Random Stress Test
+    REPEAT (1000):
+        RANDOMIZE {
+            op_type DIST { IDLE := 10%, WRITE := 35%, READ := 35%, SIMUL_RW := 20% }
+            rand_data INSIDE {[0 : (2^DATA_WIDTH)-1]}
+        }
+        CASE (op_type):
+            IDLE:     drive_idle()
+            WRITE:    drive_write(rand_data)
+            READ:     drive_read()
+            SIMUL_RW: drive_simultaneous_rw(rand_data)
+
+    // 7. Drain remaining items and report
+    WHILE (empty == 0):
+        drive_read()
+
+    PRINT("Simulation Complete. Transactions: %d, Errors: %d", transaction_count, error_count)
+    PRINT("Functional Coverage: %f%%", GET_COVERAGE(fifo_cg))
+    FINISH_SIMULATION()
